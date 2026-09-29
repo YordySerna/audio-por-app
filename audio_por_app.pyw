@@ -891,7 +891,11 @@ class Ventana:
         if not messagebox.askyesno("Audio por app",
                                    "¿Devolver todos los programas a la salida predeterminada de Windows?"):
             return
-        self.politica.limpiar_todo()
+        try:
+            self.politica.limpiar_todo()
+        except OSError as e:
+            self.aviso.configure(text=f"No se pudo devolver todo a la salida de Windows: {e}")
+            return
         for f in self.filas.values():
             f.asignada = DESCONOCIDA
         self.aviso.configure(text="Todos los programas vuelven a la salida de Windows.")
