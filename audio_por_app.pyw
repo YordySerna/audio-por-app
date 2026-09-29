@@ -10,12 +10,18 @@ volumen, así que la elección la guarda Windows: se mantiene aunque cierres
 este programa o reinicies el PC.
 """
 
+import base64
+import colorsys
 import ctypes
+import math
 import os
+import struct
 import uuid
+import winreg
+import zlib
 import tkinter as tk
 from ctypes import POINTER, byref, c_int, c_long, c_uint, c_ulong, c_ushort, c_void_p, c_wchar_p, wintypes
-from tkinter import messagebox, ttk
+from tkinter import font as tkfont, messagebox, ttk
 
 
 # ── Tipos y constantes de Windows ────────────────────────────────────────────
@@ -334,27 +340,209 @@ class PoliticaAudio:
         self.com.call(self._LIMPIAR, ())
 
 
+# ── Aspecto ──────────────────────────────────────────────────────────────────
+#
+# El aspecto de Windows 11 hecho sólo con tkinter/ttk: sigue el tema claro u
+# oscuro del sistema y su color de acento. Las esquinas redondeadas son imágenes
+# PNG que se dibujan aquí mismo al abrir (no hay archivos aparte).
+# Para ver el otro tema sin cambiar Windows: variable de entorno
+# AUDIO_POR_APP_TEMA=oscuro (o =claro).
+
+PALETAS = {
+    "oscuro": {"fondo": "#202020", "tarjeta": "#2B2B2B", "tarjeta_hover": "#323232", "borde": "#1D1D1D",
+               "divisor": "#232323", "control": "#373737", "control_hover": "#3D3D3D",
+               "control_pulsado": "#303030", "borde_control": "#454545", "borde_control_abajo": "#3A3A3A",
+               "lista": "#2C2C2C", "lista_sel": "#404040", "barra": "#6F6F6F", "barra_hover": "#9A9A9A",
+               "texto": "#FFFFFF", "texto2": "#D0D0D0", "tenue": "#9E9E9E"},
+    "claro": {"fondo": "#F3F3F3", "tarjeta": "#FBFBFB", "tarjeta_hover": "#F5F5F5", "borde": "#E5E5E5",
+              "divisor": "#EAEAEA", "control": "#FFFFFF", "control_hover": "#F8F8F8",
+              "control_pulsado": "#F3F3F3", "borde_control": "#E3E3E3", "borde_control_abajo": "#C8C8C8",
+              "lista": "#F9F9F9", "lista_sel": "#E6E6E6", "barra": "#9A9A9A", "barra_hover": "#707070",
+              "texto": "#1B1B1B", "texto2": "#4F4F4F", "tenue": "#666666"},
+}
+
+# Íconos de la fuente del sistema: Segoe Fluent Icons (Windows 11) o Segoe MDL2 Assets (10).
+ICONO_AUDIFONOS, ICONO_BLUETOOTH, ICONO_PANTALLA, ICONO_PARLANTE, ICONO_INFO = (
+    "", "", "", "", "")
+
+
+def icono_salida(nombre):
+    n = nombre.lower()
+    if any(p in n for p in ("audífono", "audifono", "auricular", "headset", "headphone")):
+        return ICONO_AUDIFONOS
+    if "bluetooth" in n:
+        return ICONO_BLUETOOTH
+    if any(p in n for p in ("hdmi", "nvidia", "monitor", "pantalla")):
+        return ICONO_PANTALLA
+    return ICONO_PARLANTE
+
+
+def _registro(ruta, valor):
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, ruta) as k:
+            return winreg.QueryValueEx(k, valor)[0]
+    except OSError:
+        return None
+
+
+def tema_oscuro():
+    forzado = os.environ.get("AUDIO_POR_APP_TEMA", "").lower()
+    if forzado in ("oscuro", "claro"):
+        return forzado == "oscuro"
+    return _registro(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "AppsUseLightTheme") == 0
+
+
+def _rgb(color):
+    return tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def _hex(rgb):
+    return "#%02X%02X%02X" % tuple(rgb)
+
+
+def _mezcla(a, b, t):
+    return tuple(round(x + (y - x) * t) for x, y in zip(a, b))
+
+
+def _contraste(a, b):
+    def luz(rgb):
+        c = [v / 255 for v in rgb]
+        c = [v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4 for v in c]
+        return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    alto, bajo = sorted((luz(a), luz(b)), reverse=True)
+    return (alto + 0.05) / (bajo + 0.05)
+
+
+def color_acento(oscuro, fondo):
+    """El acento de Windows ajustado al tema, y el color de texto que se lee encima."""
+    abgr = _registro(r"Software\Microsoft\Windows\DWM", "AccentColor")
+    base = (abgr & 0xFF, abgr >> 8 & 0xFF, abgr >> 16 & 0xFF) if isinstance(abgr, int) else (0, 120, 212)
+    # Como hace Windows: en oscuro el acento se aclara y en claro se oscurece un poco.
+    hacia, t = ((255, 255, 255), 0.3) if oscuro else ((0, 0, 0), 0.1)
+    acento = _mezcla(base, hacia, t)
+    while _contraste(acento, _rgb(fondo)) < 3 and t < 1:
+        t = min(t + 0.1, 1)
+        acento = _mezcla(base, hacia, t)
+    negro, blanco = (0, 0, 0), (255, 255, 255)
+    encima = negro if _contraste(acento, negro) >= _contraste(acento, blanco) else blanco
+    return _hex(acento), _hex(encima)
+
+
+def _png(ancho, alto, pixel):
+    """Imagen con transparencia armada a mano: pixel(x, y) -> (r, g, b, alfa)."""
+    crudo = bytearray()
+    for y in range(alto):
+        crudo.append(0)
+        for x in range(ancho):
+            crudo.extend(pixel(x + 0.5, y + 0.5))
+
+    def trozo(tipo, datos):
+        return struct.pack(">I", len(datos)) + tipo + datos + struct.pack(">I", zlib.crc32(tipo + datos))
+    png = (b"\x89PNG\r\n\x1a\n" + trozo(b"IHDR", struct.pack(">IIBBBBB", ancho, alto, 8, 6, 0, 0, 0))
+           + trozo(b"IDAT", zlib.compress(bytes(crudo))) + trozo(b"IEND", b""))
+    return tk.PhotoImage(data=base64.b64encode(png).decode("ascii"), format="png")
+
+
+def _cubre(distancia):
+    """Cuánto del píxel cae dentro de la figura (0 a 1): así el borde no sale dentado."""
+    return min(max(0.5 - distancia, 0.0), 1.0)
+
+
+def _dist_rect(x, y, ancho, alto, radio):
+    qx = abs(x - ancho / 2) - (ancho / 2 - radio)
+    qy = abs(y - alto / 2) - (alto / 2 - radio)
+    return math.hypot(max(qx, 0), max(qy, 0)) + min(max(qx, qy), 0) - radio
+
+
+def _dist_segmento(x, y, ax, ay, bx, by):
+    dx, dy = bx - ax, by - ay
+    t = max(0.0, min(1.0, ((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy)))
+    return math.hypot(x - ax - t * dx, y - ay - t * dy)
+
+
+CENTRO = 64  # px del centro de cada imagen estirable: más grande, menos trozos que repetir
+
+
+def rect_redondeado(ancho, alto, radio, relleno, borde, detras, borde_abajo=None):
+    """Rectángulo con esquinas redondeadas y borde de 1 px (el de abajo puede ir más marcado).
+
+    Las esquinas se mezclan con el color que queda detrás y la imagen sale opaca:
+    ttk no siempre repinta bien lo transparente y, además, lo opaco es mucho más
+    rápido. Tk estira estas imágenes repitiendo su centro como baldosas: por eso
+    el centro es de CENTRO px y no de 2.
+    """
+    f, b, ba, d = _rgb(relleno), _rgb(borde), _rgb(borde_abajo or borde), _rgb(detras)
+    lleno = (*f, 255)
+
+    def pixel(x, y):
+        if min(x, ancho - x, y, alto - y) > radio + 1.5:
+            return lleno
+        alfa = _cubre(_dist_rect(x, y, ancho, alto, radio))
+        dentro = _cubre(_dist_rect(x - 1, y - 1, ancho - 2, alto - 2, max(radio - 1, 0)))
+        linea = ba if y > alto - radio - 1 else b
+        return (*_mezcla(d, _mezcla(linea, f, dentro), alfa), 255)
+    return _png(ancho, alto, pixel)
+
+
+def circulo(diametro, color, ancho=None):
+    c, r = _rgb(color), diametro / 2
+    return _png(ancho or diametro, diametro,
+                lambda x, y: (*c, round(_cubre(math.hypot(x - r, y - r) - r) * 255)))
+
+
+def flecha(ancho, alto, color, grosor, margen):
+    """La flecha hacia abajo de los menús, con margen transparente a la derecha."""
+    c, g = _rgb(color), grosor / 2 + 0.5
+
+    def pixel(x, y):
+        d = min(_dist_segmento(x, y, g, g, ancho / 2, alto - g),
+                _dist_segmento(x, y, ancho / 2, alto - g, ancho - g, g))
+        return (*c, round(_cubre(d - grosor / 2 + 0.5) * 255))
+    return _png(ancho + margen, alto, pixel)
+
+
 # ── Ventana ──────────────────────────────────────────────────────────────────
 
-FONDO, TARJETA, CAMPO, BORDE = "#15171c", "#1e2128", "#272b33", "#343a45"
-TEXTO, TENUE, ACENTO = "#e9eaee", "#8a92a0", "#3ecf8e"
 DESCONOCIDA = object()
 
 
 class Fila:
+    """La tarjeta de un programa: avatar con su inicial, nombre, estado y el menú de salidas."""
+
     def __init__(self, padre, ventana, nombre):
         self.nombre = nombre
         self.pids, self.sonando, self.asignada = [], False, DESCONOCIDA
-        self.marco = ttk.Frame(padre, style="Tarjeta.TFrame", padding=(14, 10))
-        ttk.Label(self.marco, text=nombre, style="Nombre.TLabel").grid(row=0, column=0, sticky="w")
-        self.estado = ttk.Label(self.marco, style="Callado.TLabel")
-        self.estado.grid(row=1, column=0, sticky="w")
-        self.combo = ttk.Combobox(self.marco, state="readonly", width=42)
-        self.combo.grid(row=0, column=1, rowspan=2, sticky="e", padx=(16, 0))
+        self.ventana, px = ventana, ventana.px
+        self.resaltada = False
+        self.marco = ttk.Frame(padre, style="Tarjeta.TFrame", padding=(px(16), px(12), px(12), px(12)))
+        self.avatar = ventana.avatar(self.marco, nombre)
+        self.avatar.grid(row=0, column=0, rowspan=2, padx=(0, px(14)))
+        self.titulo = ttk.Label(self.marco, text=nombre, style="Nombre.TLabel")
+        self.titulo.grid(row=0, column=1, sticky="sw")
+        self.estado = ttk.Label(self.marco, style="Callado.TLabel", compound="left")
+        self.estado.grid(row=1, column=1, sticky="nw")
+        self.combo = ttk.Combobox(self.marco, state="readonly", width=42, style="Salida.TCombobox",
+                                  font=ventana.f["cuerpo"])
+        self.combo.grid(row=0, column=2, rowspan=2, sticky="e", padx=(px(16), 0))
         self.combo.bind("<<ComboboxSelected>>", lambda _e: ventana.elegir(self))
         # Tk cambia la opción con la rueda del mouse: la rueda solo desplaza la lista.
         self.combo.bind("<MouseWheel>", ventana._rueda)
-        self.marco.columnconfigure(0, weight=1)
+        self.marco.columnconfigure(1, weight=1)
+
+    def mostrar_estado(self, sonando):
+        if sonando:
+            self.estado.configure(text="Sonando", image=self.ventana.img["punto"], style="Estado.TLabel")
+        else:
+            self.estado.configure(text="En silencio", image="", style="Callado.TLabel")
+
+    def resaltar(self, activa):
+        """Fondo un poco más claro mientras el mouse está encima, como en Configuración."""
+        if activa == self.resaltada:
+            return
+        self.resaltada = activa
+        for w in (self.marco, self.titulo, self.estado):
+            w.state(["hover"] if activa else ["!hover"])
+        self.avatar.configure(bg=self.ventana.p["tarjeta_hover" if activa else "tarjeta"])
 
 
 class Ventana:
@@ -366,27 +554,25 @@ class Ventana:
         self.salidas, self.predeterminada = None, None
         self.filas = {}
         self._estilo()
+        px = self.px
 
-        cuerpo = ttk.Frame(raiz, padding=20)
+        cuerpo = ttk.Frame(raiz, padding=(px(28), px(20), px(28), px(20)))
         cuerpo.pack(fill="both", expand=True)
         cuerpo.columnconfigure(0, weight=1)
-        ttk.Label(cuerpo, text="Audio por app", style="Titulo.TLabel").grid(sticky="w")
+        cuerpo.rowconfigure(2, weight=1)
+        ttk.Label(cuerpo, text="Audio por app", style="Titulo.TLabel").grid(row=0, sticky="w")
         ttk.Label(cuerpo, text="Elige por qué salida suena cada programa.",
-                  style="Tenue.TLabel").grid(sticky="w", pady=(0, 16))
+                  style="Tenue.TLabel").grid(row=1, sticky="w", pady=(0, px(20)))
 
-        self.titulo_salidas = ttk.Label(cuerpo, style="Seccion.TLabel")
-        self.titulo_salidas.grid(sticky="w")
-        self.lista_salidas = ttk.Label(cuerpo, justify="left")
-        self.lista_salidas.grid(sticky="w", pady=(4, 18))
-
-        ttk.Label(cuerpo, text="PROGRAMAS CON AUDIO", style="Seccion.TLabel").grid(sticky="w", pady=(0, 6))
-        # Con muchos programas la lista se desplaza en vez de salirse de la pantalla.
+        # Salidas y programas se desplazan juntos si no caben, como una página de Configuración.
         marco = ttk.Frame(cuerpo)
-        marco.grid(sticky="ew")
+        marco.grid(row=2, sticky="nsew")
         marco.columnconfigure(0, weight=1)
-        self.lienzo = tk.Canvas(marco, bg=FONDO, highlightthickness=0, bd=0)
-        self.lienzo.grid(row=0, column=0, sticky="ew")
-        self.barra = ttk.Scrollbar(marco, orient="vertical", command=self.lienzo.yview)
+        marco.rowconfigure(0, weight=1)
+        self.lienzo = tk.Canvas(marco, bg=self.p["fondo"], highlightthickness=0, bd=0)
+        self.lienzo.grid(row=0, column=0, sticky="nsew")
+        self.barra = ttk.Scrollbar(marco, orient="vertical", command=self.lienzo.yview,
+                                   style="Fina.Vertical.TScrollbar")
         self.lienzo.configure(yscrollcommand=self.barra.set)
         self.lista = ttk.Frame(self.lienzo)
         self.lista.columnconfigure(0, weight=1)
@@ -394,47 +580,212 @@ class Ventana:
         self.lienzo.bind("<Configure>", lambda e: self.lienzo.itemconfigure(hueco, width=e.width))
         self.lista.bind("<Configure>", lambda e: self._ajustar_lista())
         raiz.bind_all("<MouseWheel>", self._rueda)
-        self.vacio = ttk.Label(cuerpo, style="Tenue.TLabel",
+        raiz.bind_all("<Enter>", self._resaltar, add="+")
+        raiz.bind_all("<Leave>", self._resaltar, add="+")
+
+        self.titulo_salidas = ttk.Label(self.lista, style="Seccion.TLabel")
+        self.titulo_salidas.grid(sticky="w", pady=(0, px(8)))
+        # Esquinas de 6 px: el contenido entra 3 px para no tapar la curva.
+        self.grupo = ttk.Frame(self.lista, style="Grupo.TFrame", padding=px(3))
+        self.grupo.grid(sticky="ew")
+        self.grupo.columnconfigure(0, weight=1)
+        ttk.Label(self.lista, text="Programas con audio", style="Seccion.TLabel").grid(
+            sticky="w", pady=(px(24), px(8)))
+        self.programas = ttk.Frame(self.lista)
+        self.programas.grid(sticky="ew")
+        self.programas.columnconfigure(0, weight=1)
+        self.vacio = ttk.Label(self.lista, style="Tenue.TLabel",
                                text="Ningún programa tiene el audio abierto. Pon algo a sonar y aparece aquí.")
         self.vacio.grid(sticky="w")
 
         pie = ttk.Frame(cuerpo)
-        pie.grid(sticky="ew", pady=(18, 0))
-        pie.columnconfigure(0, weight=1)
-        self.aviso = ttk.Label(pie, style="Tenue.TLabel",
+        pie.grid(row=3, sticky="ew", pady=(px(18), 0))
+        pie.columnconfigure(1, weight=1)
+        if self.iconos:
+            ttk.Label(pie, text=ICONO_INFO, style="Info.TLabel").grid(row=0, column=0, padx=(0, px(10)))
+        self.aviso = ttk.Label(pie, style="Tenue.TLabel", wraplength=px(380),
                                text="Si un juego no cambia de salida, reinícialo: algunos la leen solo al abrir.")
-        self.aviso.grid(row=0, column=0, sticky="w")
-        ttk.Button(pie, text="Todo a la de Windows", command=self.restablecer).grid(row=0, column=1, padx=(12, 0))
+        self.aviso.grid(row=0, column=1, sticky="w")
+        boton = ttk.Button(pie, text="Todo a la de Windows", style="Secundario.TButton", command=self.restablecer)
+        boton.grid(row=0, column=2, padx=(px(16), 0))
+        # El aviso usa el ancho que deja el botón y baja de línea si no cabe.
+        pie.bind("<Configure>", lambda e: self.aviso.configure(
+            wraplength=max(px(160), e.width - boton.winfo_reqwidth() - px(60))))
 
         self.refrescar()
 
+    def px(self, n):
+        """Píxeles a la escala de la pantalla (100 %, 150 %...)."""
+        return max(1, round(n * self.escala)) if n else 0
+
     def _estilo(self):
         r = self.raiz
-        r.configure(bg=FONDO)
+        self.escala = r.winfo_fpixels("1i") / 96
+        self.oscuro = tema_oscuro()
+        p = self.p = dict(PALETAS["oscuro" if self.oscuro else "claro"])
+        p["acento"], p["sobre_acento"] = color_acento(self.oscuro, p["tarjeta"])
+        px = self.px
+
+        familias = set(tkfont.families(r))
+
+        def fuente(*nombres):
+            return next((n for n in nombres if n in familias), "Segoe UI")
+        # Windows lista las variantes con el nombre cortado a 31 letras ("...Display Semib").
+        display = fuente("Segoe UI Variable Display Semib", "Segoe UI Semibold")
+        texto = fuente("Segoe UI Variable Text", "Segoe UI")
+        semi = fuente("Segoe UI Variable Text Semibold", "Segoe UI Semibold")
+        chica = fuente("Segoe UI Variable Small", "Segoe UI")
+        chica_semi = fuente("Segoe UI Variable Small Semibol", "Segoe UI Semibold")
+        self.iconos = next((n for n in ("Segoe Fluent Icons", "Segoe MDL2 Assets") if n in familias), None)
+        # Tamaños en píxeles (negativos para Tk), los mismos de la Configuración de Windows 11.
+        self.f = f = {"titulo": (display, -px(28)), "cuerpo": (texto, -px(14)), "fuerte": (semi, -px(14)),
+                      "chica": (chica, -px(12)), "pastilla": (chica_semi, -px(11)),
+                      "icono": (self.iconos or texto, -px(16)), "info": (self.iconos or texto, -px(14))}
+
+        r.configure(bg=p["fondo"])
         s = ttk.Style(r)
         s.theme_use("clam")
-        s.configure(".", background=FONDO, foreground=TEXTO, font=("Segoe UI", 10))
-        s.configure("Titulo.TLabel", font=("Segoe UI Semibold", 16))
-        s.configure("Tenue.TLabel", foreground=TENUE)
-        s.configure("Seccion.TLabel", foreground=TENUE, font=("Segoe UI Semibold", 9))
-        s.configure("Tarjeta.TFrame", background=TARJETA)
-        s.configure("Nombre.TLabel", background=TARJETA, font=("Segoe UI Semibold", 11))
-        s.configure("Callado.TLabel", background=TARJETA, foreground=TENUE, font=("Segoe UI", 9))
-        s.configure("Sonando.TLabel", background=TARJETA, foreground=ACENTO, font=("Segoe UI", 9))
-        s.configure("TCombobox", fieldbackground=CAMPO, background=CAMPO, foreground=TEXTO, arrowcolor=TEXTO,
-                    bordercolor=BORDE, lightcolor=CAMPO, darkcolor=CAMPO, padding=6)
-        s.map("TCombobox", fieldbackground=[("readonly", CAMPO)], foreground=[("readonly", TEXTO)],
-              selectbackground=[("readonly", CAMPO)], selectforeground=[("readonly", TEXTO)],
-              background=[("active", BORDE)])
-        s.configure("TButton", background=CAMPO, foreground=TEXTO, bordercolor=BORDE,
-                    lightcolor=CAMPO, darkcolor=CAMPO, padding=(12, 6))
-        s.map("TButton", background=[("active", BORDE)])
-        s.configure("Vertical.TScrollbar", background=CAMPO, troughcolor=FONDO, bordercolor=FONDO,
-                    lightcolor=CAMPO, darkcolor=CAMPO, arrowcolor=TEXTO)
-        r.option_add("*TCombobox*Listbox.background", CAMPO)
-        r.option_add("*TCombobox*Listbox.foreground", TEXTO)
-        r.option_add("*TCombobox*Listbox.selectBackground", BORDE)
-        r.option_add("*TCombobox*Listbox.font", "{Segoe UI} 10")
+        s.configure(".", background=p["fondo"], foreground=p["texto"], font=f["cuerpo"])
+        s.configure("Titulo.TLabel", font=f["titulo"])
+        s.configure("Tenue.TLabel", foreground=p["tenue"])
+        s.configure("Info.TLabel", foreground=p["tenue"], font=f["info"])
+        s.configure("Seccion.TLabel", font=f["fuerte"])
+
+        img = self.img = {}
+        rt, rc = px(6), px(4)  # radio de las tarjetas y de los controles
+
+        def imagen(nombre, *estados, **opciones):
+            """Elemento de ttk que estira la imagen sin deformar las esquinas."""
+            opciones.setdefault("width", 1)   # que mande el contenido, no el tamaño de la imagen
+            opciones.setdefault("height", 1)
+            s.element_create(nombre, "image", img[estados[0]],
+                             *((e, img[i]) for e, i in zip(estados[1::2], estados[2::2])),
+                             sticky="nsew", **opciones)
+
+        # Tarjetas
+        lado = 2 * rt + 2 + CENTRO
+        img["tarjeta"] = rect_redondeado(lado, lado, rt, p["tarjeta"], p["borde"], p["fondo"])
+        img["tarjeta_hover"] = rect_redondeado(lado, lado, rt, p["tarjeta_hover"], p["borde"], p["fondo"])
+        imagen("Tarjeta.fondo", "tarjeta", "hover", "tarjeta_hover", border=rt + 1, padding=0)
+        imagen("Grupo.fondo", "tarjeta", border=rt + 1, padding=0)
+        s.layout("Tarjeta.TFrame", [("Tarjeta.fondo", {"sticky": "nsew"})])
+        s.layout("Grupo.TFrame", [("Grupo.fondo", {"sticky": "nsew"})])
+        s.configure("Plano.TFrame", background=p["tarjeta"])
+        s.configure("Divisor.TFrame", background=p["divisor"])
+        for estilo, letra, color in (("Nombre", "cuerpo", "texto"), ("Estado", "chica", "texto2"),
+                                     ("Callado", "chica", "tenue"), ("Salida", "cuerpo", "texto"),
+                                     ("IconoSalida", "icono", "texto2")):
+            s.configure(f"{estilo}.TLabel", background=p["tarjeta"], foreground=p[color], font=f[letra])
+            s.map(f"{estilo}.TLabel", background=[("hover", p["tarjeta_hover"])])
+        img["punto"] = circulo(px(8), p["acento"], ancho=px(8) + px(7))
+
+        # Pastilla "Predeterminada"
+        alto = tkfont.Font(r, font=f["pastilla"]).metrics("linespace") + px(4)
+        alto += 1 - alto % 2
+        img["pastilla"] = rect_redondeado(alto + CENTRO, alto, alto // 2, p["acento"], p["acento"], p["tarjeta"])
+        imagen("Pastilla.fondo", "pastilla", border=alto // 2, padding=(px(9), px(2), px(9), px(2)))
+        s.layout("Pastilla.TLabel", [("Pastilla.fondo", {"sticky": "nsew", "children": [
+            ("Label.label", {"sticky": "nsew"})]})])
+        s.configure("Pastilla.TLabel", background=p["tarjeta"], foreground=p["sobre_acento"], font=f["pastilla"])
+
+        # Controles: el menú de salidas va sobre las tarjetas y el botón sobre el fondo.
+        lado = 2 * rc + 2 + CENTRO
+        for control, detras in (("campo", "tarjeta"), ("boton", "fondo")):
+            for nombre, relleno, borde, abajo in (
+                    ("", "control", "borde_control", "borde_control_abajo"),
+                    ("_hover", "control_hover", "borde_control", "borde_control_abajo"),
+                    ("_pulsado", "control_pulsado", "borde_control", "borde_control"),
+                    ("_foco", "control", "acento", "acento")):
+                img[control + nombre] = rect_redondeado(lado, lado, rc, p[relleno], p[borde], p[detras], p[abajo])
+        img["flecha"] = flecha(px(10), px(6), p["texto2"], max(1.0, 1.1 * self.escala), px(10))
+        imagen("Campo.fondo", "campo", "pressed", "campo_pulsado", "focus", "campo_foco", "hover", "campo_hover",
+               border=rc + 1, padding=0)
+        s.element_create("Campo.flecha", "image", img["flecha"], sticky="")
+        s.layout("Salida.TCombobox", [("Campo.fondo", {"sticky": "nsew", "children": [
+            ("Campo.flecha", {"side": "right", "sticky": ""}),
+            ("Combobox.padding", {"expand": "1", "sticky": "nsew", "children": [
+                ("Combobox.textarea", {"sticky": "nsew"})]})]})])
+        s.configure("Salida.TCombobox", padding=(px(11), px(6), px(6), px(6)), foreground=p["texto"],
+                    arrowsize=px(10))
+        # El texto elegido no se pinta como selección: queda del color del campo.
+        s.map("Salida.TCombobox", foreground=[("readonly", p["texto"])],
+              selectforeground=[("readonly", p["texto"])],
+              selectbackground=[("pressed", p["control_pulsado"]), ("hover", p["control_hover"]),
+                                ("readonly", p["control"])])
+        s.configure("ComboboxPopdownFrame", background=p["lista"], bordercolor=p["borde_control"],
+                    lightcolor=p["lista"], darkcolor=p["lista"], relief="solid", borderwidth=1)
+        r.option_add("*TCombobox*Listbox.background", p["lista"])
+        r.option_add("*TCombobox*Listbox.foreground", p["texto"])
+        r.option_add("*TCombobox*Listbox.selectBackground", p["lista_sel"])
+        r.option_add("*TCombobox*Listbox.selectForeground", p["texto"])
+        r.option_add("*TCombobox*Listbox.font", tkfont.Font(r, font=f["cuerpo"]))
+        r.option_add("*TCombobox*Listbox.borderWidth", px(4))  # aire alrededor de la lista
+        r.option_add("*TCombobox*Listbox.relief", "flat")
+        r.option_add("*TCombobox*Listbox.highlightThickness", 0)
+        r.option_add("*TCombobox*Listbox.activeStyle", "none")
+
+        imagen("Boton.fondo", "boton", "pressed", "boton_pulsado", "focus", "boton_foco",
+               "active", "boton_hover", border=rc + 1, padding=0)
+        s.layout("Secundario.TButton", [("Boton.fondo", {"sticky": "nsew", "children": [
+            ("Button.padding", {"sticky": "nsew", "children": [("Button.label", {"sticky": "nsew"})]})]})])
+        s.configure("Secundario.TButton", padding=(px(14), px(6)), foreground=p["texto"], anchor="center")
+        s.map("Secundario.TButton", foreground=[("pressed", p["texto2"])])
+
+        # Barra de desplazamiento fina y redondeada, sin flechas
+        ancho = px(6) | 1
+        for nombre in ("barra", "barra_hover"):
+            img[nombre] = rect_redondeado(ancho, ancho + CENTRO, ancho / 2, p[nombre], p[nombre], p["fondo"])
+        imagen("Fina.Vertical.Scrollbar.thumb", "barra", "active", "barra_hover", "pressed", "barra_hover",
+               border=ancho // 2, padding=0, width=ancho, height=px(24))
+        s.layout("Fina.Vertical.TScrollbar", [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
+            ("Fina.Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})])
+        s.configure("Fina.Vertical.TScrollbar", troughcolor=p["fondo"], background=p["fondo"],
+                    bordercolor=p["fondo"], lightcolor=p["fondo"], darkcolor=p["fondo"])
+
+    def avatar(self, padre, nombre):
+        """Círculo con la inicial del programa; el color sale del nombre y no cambia."""
+        d = self.px(32)
+        lienzo = tk.Canvas(padre, width=d, height=d, bg=self.p["tarjeta"], highlightthickness=0, bd=0)
+        tono = zlib.crc32(nombre.lower().encode()) % 360 / 360
+        luz_fondo, luz_letra, sat = (0.34, 0.86, 0.32) if self.oscuro else (0.88, 0.30, 0.50)
+        fondo = _hex(round(v * 255) for v in colorsys.hls_to_rgb(tono, luz_fondo, sat))
+        letra = _hex(round(v * 255) for v in colorsys.hls_to_rgb(tono, luz_letra, sat + 0.2))
+        if "avatar" + fondo not in self.img:
+            self.img["avatar" + fondo] = circulo(d, fondo)
+        lienzo.create_image(d / 2, d / 2, image=self.img["avatar" + fondo])
+        inicial = next((c for c in nombre if c.isalnum()), "?").upper()
+        lienzo.create_text(d / 2, d / 2, text=inicial, fill=letra, font=self.f["fuerte"])
+        return lienzo
+
+    def _resaltar(self, _e=None):
+        x, y = self.raiz.winfo_pointerxy()
+        debajo = self.raiz.winfo_containing(x, y)
+        ruta = str(debajo) if debajo else ""
+        for f in self.filas.values():
+            marco = str(f.marco)
+            f.resaltar(ruta == marco or ruta.startswith(marco + "."))
+
+    def _pintar_salidas(self, salidas, predeterminada):
+        px, n = self.px, len(salidas)
+        self.titulo_salidas.configure(text=f"{n} salida{'s' if n != 1 else ''} detectada{'s' if n != 1 else ''}")
+        for w in self.grupo.winfo_children():
+            w.destroy()
+        if not salidas:
+            ttk.Label(self.grupo, text="No hay ninguna salida de audio conectada.",
+                      style="Callado.TLabel").grid(sticky="w", padx=px(14), pady=px(10))
+        for k, (i, nombre) in enumerate(salidas):
+            if k:
+                ttk.Frame(self.grupo, style="Divisor.TFrame", height=1).grid(sticky="ew")
+            fila = ttk.Frame(self.grupo, style="Plano.TFrame", padding=(px(13), px(9), px(11), px(9)))
+            fila.grid(sticky="ew")
+            fila.columnconfigure(1, weight=1)
+            if self.iconos:
+                ttk.Label(fila, text=icono_salida(nombre), style="IconoSalida.TLabel").grid(
+                    row=0, column=0, padx=(0, px(14)))
+            ttk.Label(fila, text=nombre, style="Salida.TLabel").grid(row=0, column=1, sticky="w")
+            if i == predeterminada:
+                ttk.Label(fila, text="Predeterminada", style="Pastilla.TLabel").grid(
+                    row=0, column=2, padx=(px(12), 0))
 
     # Opciones del menú: la primera siempre es "seguir a Windows".
     def _opciones(self):
@@ -458,11 +809,7 @@ class Ventana:
     def pintar(self, salidas, predeterminada, sesiones):
         if (salidas, predeterminada) != (self.salidas, self.predeterminada):
             self.salidas, self.predeterminada = salidas, predeterminada
-            n = len(salidas)
-            self.titulo_salidas.configure(text=f"{n} SALIDA{'S' if n != 1 else ''} DETECTADA{'S' if n != 1 else ''}")
-            self.lista_salidas.configure(text="\n".join(
-                f"•  {nombre}" + ("     predeterminada de Windows" if i == predeterminada else "")
-                for i, nombre in salidas) or "No hay ninguna salida de audio conectada.")
+            self._pintar_salidas(salidas, predeterminada)
             for f in self.filas.values():
                 f.combo["values"] = self._opciones()
                 f.asignada = DESCONOCIDA
@@ -479,11 +826,10 @@ class Ventana:
         for clave, (nombre, pids, sonando) in programas.items():
             f = self.filas.get(clave)
             if f is None:
-                f = self.filas[clave] = Fila(self.lista, self, nombre)
+                f = self.filas[clave] = Fila(self.programas, self, nombre)
                 f.combo["values"] = self._opciones()
             f.pids, f.sonando = sorted(pids), sonando
-            f.estado.configure(text="● sonando" if sonando else "en silencio",
-                               style="Sonando.TLabel" if sonando else "Callado.TLabel")
+            f.mostrar_estado(sonando)
             asignada = self._asignada(f.pids)
             if asignada != f.asignada:
                 f.asignada = asignada
@@ -491,20 +837,21 @@ class Ventana:
 
         orden = sorted(self.filas.values(), key=lambda f: (not f.sonando, f.nombre.lower()))
         for i, f in enumerate(orden):
-            f.marco.grid(row=i, column=0, sticky="ew", pady=(0, 6))
+            f.marco.grid(row=i, column=0, sticky="ew", pady=(0, self.px(4)))
         if self.filas:
             self.vacio.grid_remove()
         else:
             self.vacio.grid()
+        self.lista.update_idletasks()  # que Tk mida las tarjetas nuevas antes de ajustar el alto
         self._ajustar_lista()
 
     def _ajustar_lista(self):
-        alto = self.lista.winfo_reqheight() if self.filas else 0
-        tope = self.raiz.winfo_screenheight() // 2
+        alto = self.lista.winfo_reqheight()
+        tope = int(self.raiz.winfo_screenheight() * 0.6)
         self.lienzo.configure(width=self.lista.winfo_reqwidth(), height=max(min(alto, tope), 1),
                               scrollregion=(0, 0, 0, alto))
         if alto > tope:
-            self.barra.grid(row=0, column=1, sticky="ns", padx=(6, 0))
+            self.barra.grid(row=0, column=1, sticky="ns", padx=(self.px(8), 0))
         else:
             self.barra.grid_remove()
             self.lienzo.yview_moveto(0)
@@ -550,6 +897,23 @@ class Ventana:
         self.aviso.configure(text="Todos los programas vuelven a la salida de Windows.")
 
 
+def ventana_nativa(raiz, oscuro, fondo):
+    """Barra de título y esquinas como las de Windows 11. Lo que Windows 10 no conoce, lo ignora."""
+    try:
+        raiz.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(raiz.winfo_id())
+        r, g, b = _rgb(fondo)
+        atributos = [(33, 2),                          # esquinas redondeadas
+                     (35, r | g << 8 | b << 16)]       # barra de título del color de la ventana
+        if oscuro:
+            atributos.insert(0, (20, 1))               # barra de título oscura
+        for atributo, valor in atributos:
+            v = c_int(valor)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, atributo, byref(v), ctypes.sizeof(v))
+    except (AttributeError, OSError):
+        pass
+
+
 def main():
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)  # texto nítido en pantallas con escala
@@ -557,18 +921,13 @@ def main():
         pass
     raiz = tk.Tk()
     raiz.title("Audio por app")
-    raiz.minsize(600, 0)
-    try:  # barra de título oscura, a juego con la ventana
-        raiz.update_idletasks()
-        hwnd = ctypes.windll.user32.GetParent(raiz.winfo_id())
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, byref(c_int(1)), ctypes.sizeof(c_int))
-    except (AttributeError, OSError):
-        pass
     try:
-        Ventana(raiz)
+        ventana = Ventana(raiz)
     except OSError as e:
         messagebox.showerror("Audio por app", str(e))
         return
+    raiz.minsize(ventana.px(600), 0)
+    ventana_nativa(raiz, ventana.oscuro, ventana.p["fondo"])
     raiz.mainloop()
 
 
